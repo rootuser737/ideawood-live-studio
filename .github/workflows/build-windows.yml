@@ -1,0 +1,149 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Download FFmpeg (bundled, so the app works offline)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin | Out-Null
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $bin = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $bin.FullName bin\ffmpeg.exe
+          Copy-Item (Join-Path $bin.DirectoryName "ffprobe.exe") bin\ffprobe.exe
+          bin\ffmpeg.exe -version | Select-Object -First 1
+
+      - name: Download whisper.cpp (speech engine + live server, bundled)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip"
+          Invoke-WebRequest $url -OutFile whisper.zip
+          Expand-Archive whisper.zip -DestinationPath whisper_tmp
+          $cli = Get-ChildItem whisper_tmp -Recurse -Filter whisper-cli.exe | Select-Object -First 1
+          New-Item -ItemType Directory -Force bin\whisper | Out-Null
+          Copy-Item $cli.FullName bin\whisper\whisper-cli.exe
+          Copy-Item (Join-Path $cli.DirectoryName "whisper-server.exe") bin\whisper\whisper-server.exe
+          Get-ChildItem $cli.DirectoryName -Filter *.dll | Copy-Item -Destination bin\whisper
+          Get-ChildItem bin\whisper | Select-Object Name, Length
+
+      - name: Cache the bundled speech model
+        uses: actions/cache@v4
+        with:
+          path: models/whisper
+          key: whisper-model-ggml-base.en-v1
+
+      - name: Download the speech model bundled INSIDE the app
+        shell: pwsh
+        run: |
+          $file = "ggml-base.en.bin"
+          New-Item -ItemType Directory -Force models\whisper | Out-Null
+          $dest = "models\whisper\$file"
+          if (-not (Test-Path $dest) -or (Get-Item $dest).Length -lt 140000000) {
+            Invoke-WebRequest "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$file" -OutFile $dest
+          }
+          $len = (Get-Item $dest).Length
+          Write-Output "bundled model: $file = $len bytes"
+          if ($len -lt 140000000) { throw "Speech model download looks incomplete ($len bytes)" }
+
+      - name: Tests
+        id: tests
+        shell: bash          # bash -e: any failing test fails the step (PowerShell only checks the last command)
+        run: |
+          python tests/test_live_captions.py
+          python tests/test_live_pipeline.py
+          python tests/test_ui.py
+          python tests/test_windows.py
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: "1"
+
+      - name: Report results as annotations (Windows details, real live captions)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: "1"
+        run: |
+          function Report($title, $out, $code, $always) {
+            $t = ($out -replace "`r", "")
+            if ($t.Length -gt 3000) { $t = $t.Substring($t.Length - 3000) }
+            $t = ($t -replace "%", "%25") -replace "`n", "%0A"
+            if ($code -eq 0) { if ($always) { Write-Output "::notice title=$title::$t" } }
+            else { Write-Output "::warning title=$title FAILED (exit $code)::$t" }
+          }
+          if ("${{ steps.tests.outcome }}" -ne "success") {
+            foreach ($n in "test_live_captions","test_live_pipeline","test_ui","test_windows") {
+              $o = & python "tests/$n.py" 2>&1 | Out-String
+              Report $n $o $LASTEXITCODE $false
+            }
+          }
+          $o = & python tests/test_windows.py 2>&1 | Out-String
+          Report "Windows checks" $o $LASTEXITCODE $true
+          $env:WHISPER_SERVER = (Resolve-Path "bin\whisper\whisper-server.exe").Path
+          $env:IDEAWOOD_TEST_MODEL = (Resolve-Path "models\whisper\ggml-base.en.bin").Path
+          $env:IDEAWOOD_REAL_ASR = "1"
+          $o = & python tests/test_live_captions.py 2>&1 | Out-String
+          Report "REAL live captions (bundled base.en, JFK audio in real time)" $o $LASTEXITCODE $true
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name IdeawoodLiveStudio `
+            --icon assets\icon.ico --add-data "assets;assets" --add-data "models;models" `
+            --add-binary "bin\ffmpeg.exe;bin" --add-binary "bin\ffprobe.exe;bin" `
+            --add-data "bin\whisper;bin\whisper" `
+            --collect-all onnxruntime --collect-all pyvirtualcam `
+            main.py
+          Copy-Item dist\IdeawoodLiveStudio.exe "dist\IdeawoodLiveStudio-${{ github.ref_name }}.exe"
+
+      - name: Check the models are really inside the EXE
+        shell: pwsh
+        run: |
+          $mb = [math]::Round((Get-Item dist\IdeawoodLiveStudio.exe).Length / 1MB)
+          Write-Output "EXE size: $mb MB"
+          if ($mb -lt 330) { throw "EXE is only $mb MB - the speech/AI models were not bundled" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IdeawoodLiveStudio-windows
+          path: dist/IdeawoodLiveStudio.exe
+
+      - name: Release notes from CHANGELOG (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          $text = Get-Content CHANGELOG.md -Raw
+          $m = [regex]::Match($text, "(?ms)^## " + [regex]::Escape($ver) + " .*?(?=^## |\z)")
+          if ($m.Success) { $m.Value | Set-Content notes.md -Encoding utf8 } else { "Release $ver" | Set-Content notes.md }
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Ideawood Live Studio ${{ github.ref_name }}
+          body_path: notes.md
+          files: dist/IdeawoodLiveStudio-${{ github.ref_name }}.exe

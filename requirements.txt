@@ -1,0 +1,5 @@
+PySide6>=6.6
+numpy>=1.26
+onnxruntime>=1.17
+opencv-python-headless>=4.9
+pyvirtualcam>=0.11
