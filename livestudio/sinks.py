@@ -120,7 +120,8 @@ class Streamer:
                *self._extra]
         outs = [f"[f=flv:onfail=ignore]{u}" for u in self.urls]
         if self.record_path:
-            outs.append(f"[f=matroska]{self.record_path}")
+            # the tee muxer treats backslashes as escapes: Windows paths MUST use forward slashes here
+            outs.append(f"[f=matroska]{self.record_path.replace(chr(92), '/')}")
         if len(outs) == 1 and self.record_path and not self.urls:
             return cmd + ["-f", "matroska", self.record_path]
         return cmd + ["-f", "tee", "|".join(outs)]

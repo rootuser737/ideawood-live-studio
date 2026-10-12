@@ -15,6 +15,10 @@ from livestudio.sinks import Streamer, rtmp_url
 from livestudio.sources import FrameSource, MicSource, wav_args
 
 app = QApplication.instance() or QApplication([])
+# the tee muxer eats backslashes: a Windows-style recording path must reach ffmpeg with forward slashes
+_cmd = Streamer(640, 360, 30, ["rtmp://x/live/k"], "D:\\a\\work\\My Videos\\live 1.mkv").build_cmd(1234)
+assert _cmd[-1].endswith("[f=matroska]D:/a/work/My Videos/live 1.mkv") and "\\" not in _cmd[-1], _cmd[-1]
+
 HERE = os.path.dirname(os.path.abspath(__file__)); T = tempfile.mkdtemp(); ff = find_tool("ffmpeg")
 W, H, FPS = 640, 360, 15
 recv = os.path.join(T, "received.flv")
